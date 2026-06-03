@@ -1,4 +1,7 @@
-# Modification plan — docs split (post-import, opt-in)
+# Implementation Plan — docs split (post-import, opt-in)
+
+> Scope: this plan covers the in-flight **namespace docs-split** feature. It's the project's
+> single active build arc; broaden it (or add phases above) when the next feature lands.
 
 ## Goal
 
