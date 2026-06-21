@@ -4,6 +4,7 @@
  *
  * Subcommands:
  *   probe <url>             Detect source type + return JSON plan
+ *   discover <url>          Discover docs framework + candidate page graph
  *   fetch-clean <url>       Fetch a single URL and print clean markdown to stdout
  *   openapi <spec-url>      Parse an OpenAPI/Swagger spec into structured JSON grouped by tag
  *   check <namespace>       Check namespace health
@@ -382,6 +383,295 @@ async function runProbe(rawUrl: string): Promise<ProbeResult> {
     rendering,
     mdTwin,
     warnings,
+  };
+}
+
+/* ---------- discover ---------- */
+
+type DocsFramework = 'docusaurus' | 'mkdocs' | 'vitepress' | 'unknown';
+type DiscoverSource = 'llms.txt' | 'openapi' | 'sitemap' | 'search-index' | 'nav' | 'markdown-twin';
+
+interface DiscoverPage {
+  url: string;
+  title: string | null;
+  section: string;
+  sources: DiscoverSource[];
+}
+
+interface DiscoverResult {
+  rootUrl: string;
+  scopeUrl: string;
+  framework: DocsFramework;
+  confidence: 'high' | 'medium' | 'low';
+  title: string | null;
+  summary: string | null;
+  suggestedNamespace: string;
+  suggestedProfile: 'api' | 'website' | 'library' | 'notes';
+  recommendedMode: 'llmstxt' | 'openapi' | 'local-docs' | 'single-page';
+  sources: {
+    llmsTxtUrl: string | null;
+    openapiSpecUrl: string | null;
+    sitemapUrls: string[];
+    searchIndexUrls: string[];
+    navLinks: number;
+    markdownTwin: string | null;
+  };
+  pages: DiscoverPage[];
+  sections: { name: string; count: number; sampleUrls: string[] }[];
+  warnings: string[];
+  nextSteps: string[];
+}
+
+interface SearchIndexPage {
+  url: string;
+  title: string | null;
+}
+
+function docsScopeUrl(root: string): string {
+  const u = new URL(root);
+  const parts = u.pathname.split('/').filter(Boolean);
+  if (parts.length > 1) {
+    const first = parts[0].toLowerCase();
+    if (/^(docs|guide|guides|learn|reference|api|manual|tutorial|tutorials|handbook)$/.test(first)) {
+      u.pathname = `/${parts[0]}/`;
+      u.search = '';
+      u.hash = '';
+      return u.toString();
+    }
+  }
+  u.pathname = '/';
+  u.search = '';
+  u.hash = '';
+  return u.toString();
+}
+
+function sameScope(scope: string, url: string): boolean {
+  try {
+    const s = new URL(scope);
+    const u = new URL(url);
+    if (s.origin !== u.origin) return false;
+    return u.pathname.startsWith(s.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function stripHtml(input: string): string {
+  return input.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function detectDocsFramework(html: string): { framework: DocsFramework; confidence: 'high' | 'medium' | 'low'; signals: string[] } {
+  const signals: string[] = [];
+  const generator = html.match(/<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)["']/i)?.[1]?.trim();
+  if (generator) signals.push(`generator:${generator}`);
+  const lower = html.toLowerCase();
+
+  if (/docusaurus/i.test(generator ?? '') || lower.includes('__docusaurus') || lower.includes('docusaurus')) {
+    return { framework: 'docusaurus', confidence: generator || lower.includes('__docusaurus') ? 'high' : 'medium', signals };
+  }
+  if (/mkdocs/i.test(generator ?? '') || lower.includes('mkdocs') || lower.includes('material for mkdocs')) {
+    return { framework: 'mkdocs', confidence: generator ? 'high' : 'medium', signals };
+  }
+  if (/vitepress/i.test(generator ?? '') || lower.includes('vitepress') || lower.includes('__vitepress') || lower.includes('vp-')) {
+    return { framework: 'vitepress', confidence: generator || lower.includes('vitepress') ? 'high' : 'medium', signals };
+  }
+  return { framework: 'unknown', confidence: 'low', signals };
+}
+
+function searchIndexCandidates(root: string, scope: string): string[] {
+  const candidates = new Set<string>();
+  for (const base of [new URL(root).origin + '/', scope]) {
+    candidates.add(joinUrl(base, 'search/search_index.json'));
+    candidates.add(joinUrl(base, 'search_index.json'));
+    candidates.add(joinUrl(base, 'assets/search.json'));
+  }
+  return [...candidates];
+}
+
+function parseSearchIndex(raw: unknown, indexUrl: string): SearchIndexPage[] {
+  const docs = Array.isArray((raw as any)?.docs)
+    ? (raw as any).docs
+    : Array.isArray((raw as any)?.pages)
+      ? (raw as any).pages
+      : Array.isArray(raw)
+        ? raw
+        : [];
+
+  const pages: SearchIndexPage[] = [];
+  for (const doc of docs) {
+    const location = doc?.location ?? doc?.url ?? doc?.path;
+    if (!location || typeof location !== 'string') continue;
+    const title = typeof doc?.title === 'string'
+      ? stripHtml(doc.title)
+      : typeof doc?.text === 'string'
+        ? stripHtml(doc.text).slice(0, 80)
+        : null;
+    try {
+      pages.push({ url: canonicalize(new URL(location, indexUrl).toString()), title: title || null });
+    } catch { /* skip */ }
+  }
+  return pages;
+}
+
+async function findSearchIndexPages(root: string, scope: string): Promise<{ urls: string[]; pages: SearchIndexPage[] }> {
+  const urls: string[] = [];
+  const pages: SearchIndexPage[] = [];
+  for (const candidate of searchIndexCandidates(root, scope)) {
+    const index = await tryFetchJson<unknown>(candidate);
+    const parsed = index ? parseSearchIndex(index, candidate) : [];
+    if (!parsed.length) continue;
+    urls.push(candidate);
+    pages.push(...parsed);
+  }
+  return { urls, pages };
+}
+
+function inferSection(scope: string, pageUrl: string): string {
+  try {
+    const s = new URL(scope);
+    const u = new URL(pageUrl);
+    const relative = u.pathname.slice(s.pathname.length).replace(/^\/+/, '');
+    const first = relative.split('/').filter(Boolean)[0] ?? 'overview';
+    return first.replace(/\.(html?|mdx?)$/i, '') || 'overview';
+  } catch {
+    return 'overview';
+  }
+}
+
+function pageIdentity(url: string): string {
+  const u = new URL(url);
+  u.hash = '';
+  u.search = '';
+  u.pathname = u.pathname
+    .replace(/\/index\.(html?|mdx?)$/i, '')
+    .replace(/\.(html?|mdx?)$/i, '')
+    .replace(/\/+$/g, '');
+  return `${u.origin}${u.pathname || '/'}`;
+}
+
+function shouldPreferPageUrl(current: string, next: string): boolean {
+  const currentPath = new URL(current).pathname;
+  const nextPath = new URL(next).pathname;
+  if (/\.(md|mdx)$/i.test(nextPath) && !/\.(md|mdx)$/i.test(currentPath)) return true;
+  if (!/\.(html?)$/i.test(nextPath) && /\.(html?)$/i.test(currentPath)) return true;
+  return false;
+}
+
+function addPage(map: Map<string, DiscoverPage>, scope: string, url: string, title: string | null, source: DiscoverSource): void {
+  if (!sameScope(scope, url)) return;
+  if (/\.(png|jpe?g|gif|svg|webp|pdf|zip|tgz|gz|css|js)$/i.test(new URL(url).pathname)) return;
+  const normalizedUrl = canonicalize(url);
+  const key = pageIdentity(normalizedUrl);
+  const current = map.get(key);
+  if (current) {
+    if (!current.title && title) current.title = title;
+    if (shouldPreferPageUrl(current.url, normalizedUrl)) current.url = normalizedUrl;
+    if (!current.sources.includes(source)) current.sources.push(source);
+    return;
+  }
+  map.set(key, { url: normalizedUrl, title, section: inferSection(scope, normalizedUrl), sources: [source] });
+}
+
+function summarizeSections(pages: DiscoverPage[]): { name: string; count: number; sampleUrls: string[] }[] {
+  const groups = new Map<string, DiscoverPage[]>();
+  for (const page of pages) groups.set(page.section, [...(groups.get(page.section) ?? []), page]);
+  return [...groups.entries()]
+    .map(([name, group]) => ({ name, count: group.length, sampleUrls: group.slice(0, 5).map((page) => page.url) }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+async function runDiscover(rawUrl: string): Promise<DiscoverResult> {
+  if (!rawUrl) die('discover requires a URL');
+  const root = canonicalize(rawUrl);
+  const scope = docsScopeUrl(root);
+  const warnings: string[] = [];
+  const pages = new Map<string, DiscoverPage>();
+
+  const html = await tryFetchText(root);
+  const meta = html ? extractMeta(html) : { title: null, description: null };
+  const framework = html
+    ? detectDocsFramework(html)
+    : { framework: 'unknown' as DocsFramework, confidence: 'low' as const, signals: [] };
+
+  const openapiSpecUrl = await findOpenApi(root);
+  const llmsTxtUrl = joinUrl(new URL(root).origin + '/', 'llms.txt');
+  const llmsText = await tryFetchText(llmsTxtUrl);
+  let usableLlmsTxtUrl: string | null = null;
+  if (llmsText && /^#\s+/m.test(llmsText)) {
+    usableLlmsTxtUrl = llmsTxtUrl;
+    for (const url of parseLlmsLinks(llmsText, root).urls) addPage(pages, scope, url, null, 'llms.txt');
+  }
+
+  const sitemapUrls: string[] = [];
+  for (const candidate of ['/sitemap.xml', '/sitemap_index.xml']) {
+    const sitemapUrl = joinUrl(new URL(root).origin + '/', candidate);
+    const found = await parseSitemap(sitemapUrl);
+    const scoped = found.filter((url) => sameScope(scope, url));
+    if (!scoped.length) continue;
+    sitemapUrls.push(sitemapUrl);
+    for (const url of scoped) addPage(pages, scope, url, null, 'sitemap');
+  }
+
+  const search = await findSearchIndexPages(root, scope);
+  for (const page of search.pages) addPage(pages, scope, page.url, page.title, 'search-index');
+
+  let navLinks: string[] = [];
+  if (html) {
+    navLinks = extractNavLinks(html, scope).filter((url) => sameScope(scope, url));
+    for (const url of navLinks) addPage(pages, scope, url, null, 'nav');
+  } else {
+    warnings.push('could not fetch root URL for framework/nav detection');
+  }
+
+  const markdownTwin = await findMdTwin(root);
+  if (markdownTwin) addPage(pages, scope, markdownTwin, meta.title, 'markdown-twin');
+  addPage(pages, scope, root, meta.title, 'nav');
+
+  const sortedPages = [...pages.values()].sort((a, b) => a.url.localeCompare(b.url)).slice(0, 300);
+  if (pages.size > sortedPages.length) warnings.push(`candidate pages capped at ${sortedPages.length} of ${pages.size}`);
+  if (framework.framework === 'unknown') warnings.push('docs framework was not confidently detected; rely on sitemap/search/nav evidence');
+  if (sortedPages.length <= 1 && !usableLlmsTxtUrl && !openapiSpecUrl) warnings.push('only one scoped page discovered; narrow/deep URLs may need a broader docs root');
+
+  const recommendedMode = openapiSpecUrl
+    ? 'openapi'
+    : usableLlmsTxtUrl
+      ? 'llmstxt'
+      : sortedPages.length > 1
+        ? 'local-docs'
+        : 'single-page';
+
+  const nextSteps = recommendedMode === 'openapi'
+    ? [`pnpm docs-import openapi ${openapiSpecUrl}`]
+    : recommendedMode === 'llmstxt'
+      ? [`Add Imported Docs from ${usableLlmsTxtUrl}, or use discovered pages to compose a focused Local Docs namespace.`]
+      : [
+          `Review sections and choose scope before fetching ${sortedPages.length} pages.`,
+          `Fetch selected pages with pnpm docs-import fetch-clean <url>; prefer source markdown when available.`,
+          `Compose a draft Local Docs namespace using profile library and namespace ${suggestNamespace(root)}.`,
+        ];
+
+  return {
+    rootUrl: root,
+    scopeUrl: scope,
+    framework: framework.framework,
+    confidence: framework.confidence,
+    title: meta.title,
+    summary: meta.description,
+    suggestedNamespace: suggestNamespace(root),
+    suggestedProfile: 'library',
+    recommendedMode,
+    sources: {
+      llmsTxtUrl: usableLlmsTxtUrl,
+      openapiSpecUrl,
+      sitemapUrls,
+      searchIndexUrls: search.urls,
+      navLinks: navLinks.length,
+      markdownTwin,
+    },
+    pages: sortedPages,
+    sections: summarizeSections(sortedPages),
+    warnings,
+    nextSteps,
   };
 }
 
@@ -1026,6 +1316,7 @@ async function main() {
         '',
         'Commands:',
         '  probe <url>           Detect source kind + return JSON plan',
+        '  discover <url>        Discover docs framework + candidate page graph',
         '  fetch-clean <url>     Fetch + clean to markdown on stdout (use --render for CSR/SPAs)',
         '  openapi <spec-url>    Parse OpenAPI/Swagger spec into JSON grouped by tag',
         '  check <namespace>     Check namespace health (or use --all, --json)',
@@ -1039,6 +1330,11 @@ async function main() {
   switch (cmd) {
     case 'probe': {
       const out = await runProbe(args[0]);
+      process.stdout.write(JSON.stringify(out, null, 2) + '\n');
+      return;
+    }
+    case 'discover': {
+      const out = await runDiscover(args[0]);
       process.stdout.write(JSON.stringify(out, null, 2) + '\n');
       return;
     }

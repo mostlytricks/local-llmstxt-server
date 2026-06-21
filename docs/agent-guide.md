@@ -12,6 +12,9 @@ You have one CLI: **`docs-import`** (run via `pnpm docs-import <subcommand> <arg
 pnpm docs-import probe <url>
   → JSON plan: { kind, rootUrl, title, summary, suggestedNamespace, seedUrls, openapiSpecUrl, warnings }
 
+pnpm docs-import discover <url>
+  → JSON discovery report for framework docs: { framework, scopeUrl, pages, sections, sources, recommendedMode }
+
 pnpm docs-import fetch-clean <url>
   → stdout: clean markdown (Readability-extracted, sanity-checked)
   → exit 1 if the page fails sanity (too short, HTML leaked, no real content)
@@ -49,7 +52,15 @@ Default to **A** unless the operator says otherwise.
 
 ## 2. Identify the source type
 
-Run `pnpm docs-import probe <url>` and read `result.kind`:
+Run `pnpm docs-import probe <url>` and read `result.kind`.
+
+For Docusaurus, MkDocs, VitePress, or any deep docs page where `probe` returns only one seed URL, run:
+
+```
+pnpm docs-import discover <url>
+```
+
+Use `discover` as the page-map planner. It detects the framework when possible, infers a docs scope such as `/guide/` or `/docs/`, merges sitemap/search-index/nav evidence, and returns candidate pages grouped into sections. Do not paste pages one by one when `discover.pages` gives a usable map.
 
 | `kind` | What it means | Next workflow |
 |---|---|---|
@@ -67,9 +78,11 @@ Don't try to detect manually. `probe` already does the candidate-URL probing and
 
 ### Discovery
 
-`probe` already returned a `seedUrls` array. URLs are canonicalized and same-prefix-filtered for you. **Don't re-discover.**
+`probe` may already return a `seedUrls` array. URLs are canonicalized and same-prefix-filtered for you.
 
-If `seedUrls` is empty or just `[rootUrl]`, the probe couldn't find a usable nav/sitemap — treat as Workflow C.
+If the input is a framework docs site or a deep page, prefer `discover.pages` over manually crawling links from rendered HTML. It is designed to find docs-site structures from sitemap, search index, sidebar/nav, and markdown twins.
+
+If `seedUrls` is empty or just `[rootUrl]`, run `discover <url>` before treating the input as Workflow C. Only fall back to single-page import when `discover` also finds one scoped page.
 
 ### Crawl plan
 
